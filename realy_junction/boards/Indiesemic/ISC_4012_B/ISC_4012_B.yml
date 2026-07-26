@@ -1,0 +1,10 @@
+identifier: ISC_4012_B/nrf52840
+name: ISC_40120_B
+vendor: Indiesemic
+type: mcu
+arch: arm
+ram: 256
+flash: 1024
+toolchain:
+  - zephyr
+supported: []

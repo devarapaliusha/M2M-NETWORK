@@ -1,0 +1,10 @@
+identifier: ISC_4012_B/nrf52840
+name: nrf52840 interfaced with llcc68 
+vendor: Indiesemic
+type: mcu
+arch: arm
+ram: 256
+flash: 1024
+toolchain:
+  - zephyr
+supported: []

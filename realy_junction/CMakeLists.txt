@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+
+project(relay_e5)
+
+target_sources(app PRIVATE src/main.c
+    components/ISC_SX1262_LIB/llcc68_driver.c
+    components/lora_radio/radio_driver.c
+)
+
+target_include_directories(app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/components/ISC_SX1262_LIB
+    ${CMAKE_CURRENT_SOURCE_DIR}/components/lora_radio
+
+)
