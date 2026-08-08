@@ -1,0 +1,5 @@
+board:
+  name: ISC_4012_B
+  vendor: Indiesemic
+  socs:
+    - name: nrf52840
