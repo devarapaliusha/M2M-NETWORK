@@ -18,30 +18,43 @@
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 
+/* =========================================================
+ * GPIO
+ * ========================================================= */
 
 #define LED_PIN 17
 
 
-#define DEV_ID 0x88
+/* =========================================================
+ * DEVICE ID / TUNNEL ID
+ *
+ * These are completely independent.
+ *
+ * Device ID  = 0x87
+ * Tunnel ID  = 0x81
+ * ========================================================= */
+
+#define DEV_ID       0x88
 
 
+/* =========================================================
+ * QoS / Hop / Flags
+ *
+ * Byte 3:
+ *
+ * Bit 7-6 = QoS
+ * Bit 5-3 = Hop Count
+ * Bit 2-0 = Flags
+ * ========================================================= */
 
-/* Existing tunnel bits */
-
-#define TUNNEL_MASK 0xC0
-
-
-
-/* New QoS Header */
-
-#define DEFAULT_QOS      1     // 2 bits
-#define DEFAULT_HOP      0     // 3 bits
-#define DEFAULT_FLAGS    0     // 3 bits
+#define DEFAULT_QOS    1
+#define DEFAULT_HOP    0
+#define DEFAULT_FLAGS  0
 
 
-
-
-/* INA219 */
+/* =========================================================
+ * INA219
+ * ========================================================= */
 
 #define INA219_ADDR 0x40
 
@@ -51,83 +64,64 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 #define REG_CAL     0x05
 
 
-
-
+/* =========================================================
+ * GLOBAL VARIABLES
+ * ========================================================= */
 
 static const struct device *i2c;
-
 static const struct device *gpio0;
 
 
-
-
 /*
- Packet Format
+ * Packet Header
+ *
+ * Byte 0 = Command + Payload ID
+ * Byte 1 = Device ID
+ * Byte 2 = QoS + Hop + Flags
+ */
 
- Byte0 : Command
- Byte1 : Device ID + Tunnel ID  (existing)
- Byte2 : QoS + Hop Count + Flags
- Byte3 : Payload
-
-*/
-
-
-uint8_t p_hdr[3];
-
-
+uint8_t p_hdr[3] = {0};
 
 uint16_t p_id = 0x03;
 
-
 float bat_v = 0.0f;
-
-
 
 char *data;
 
+char us[256] = {0};
 
-char us[256]={0};
-
-
-
-volatile bool timeout=false;
+volatile bool timeout = false;
 
 
-
-
-
-
-/* ================= DEVICE ID ================= */
-
+/* =========================================================
+ * PRINT DEVICE INFORMATION
+ * ========================================================= */
 
 void print_device_id(void)
 {
+    uint32_t id0 = NRF_FICR->DEVICEID[0];
+    uint32_t id1 = NRF_FICR->DEVICEID[1];
 
-uint32_t id0 = NRF_FICR->DEVICEID[0];
+    printf("NRF Hardware Device ID: %08X%08X\n",
+           id1,
+           id0);
 
-uint32_t id1 = NRF_FICR->DEVICEID[1];
+    LOG_INF("Application Device ID : 0x%02X",
+            DEV_ID);
+    }
 
-
-printf("Device ID: %08X%08X\n",
-       id1,id0);
-
-}
-
-
-
-
+    
 
 
-/* ================= TIMER ================= */
-
+/* =========================================================
+ * TIMER CALLBACK
+ * ========================================================= */
 
 void ch_tmr_cb(struct k_timer *timer)
 {
+    LOG_INF("Channel health check timeout, sending...");
 
-LOG_INF("Channel health check timeout, sending...");
-
-timeout=true;
-
+    timeout = true;
 }
 
 
@@ -136,736 +130,657 @@ K_TIMER_DEFINE(timeout_timer,
                NULL);
 
 
+/* =========================================================
+ * INA219 WRITE
+ * ========================================================= */
 
-
-
-
-
-/* ================= INA219 ================= */
-
-
-static int wr(uint8_t reg,uint16_t val)
+static int wr(uint8_t reg, uint16_t val)
 {
+    uint8_t b[3] =
+    {
+        reg,
+        val >> 8,
+        val
+    };
 
-uint8_t b[3]={reg,val>>8,val};
-
-
-return i2c_write(i2c,
-                 b,
-                 3,
-                 INA219_ADDR);
-
+    return i2c_write(i2c,
+                     b,
+                     3,
+                     INA219_ADDR);
 }
 
 
+/* =========================================================
+ * INA219 READ
+ * ========================================================= */
 
-
-static int rd(uint8_t reg,int16_t *val)
+static int rd(uint8_t reg, int16_t *val)
 {
+    uint8_t b[2];
 
-uint8_t b[2];
-
-
-int ret=i2c_write_read(i2c,
+    int ret =
+        i2c_write_read(i2c,
                        INA219_ADDR,
                        &reg,
                        1,
                        b,
                        2);
 
+    *val = (b[0] << 8) | b[1];
 
-
-*val=(b[0]<<8)|b[1];
-
-
-return ret;
-
+    return ret;
 }
 
 
-
-
-
+/* =========================================================
+ * BATTERY VOLTAGE
+ * ========================================================= */
 
 float battery_voltage(void)
 {
+    static bool init;
 
-static bool init;
-
-int16_t raw;
-
+    int16_t raw;
 
 
-if(!init)
+    if (!init)
+    {
+        i2c =
+            DEVICE_DT_GET(DT_NODELABEL(i2c0));
+
+
+        if (!device_is_ready(i2c))
+        {
+            LOG_ERR("I2C device not ready");
+
+            return -1.0f;
+        }
+
+
+        wr(REG_CAL, 4096);
+
+        wr(REG_CFG, 0x399F);
+
+        k_msleep(15);
+
+        init = true;
+    }
+
+
+    rd(REG_SHUNT, &raw);
+
+    float shunt =
+        raw * 0.01f;
+
+
+    rd(REG_BUS, &raw);
+
+    float bus =
+        ((uint16_t)raw >> 3) * 0.004f;
+
+
+    return bus + (shunt / 1000.0f);
+}
+
+
+/* =========================================================
+ * PAYLOAD COUNTER
+ * ========================================================= */
+
+uint8_t pld_cnt(void)
 {
-
-i2c=DEVICE_DT_GET(DT_NODELABEL(i2c0));
-
+    p_id = p_id + 0x01;
 
 
-if(!device_is_ready(i2c))
-
-return -1.0f;
-
-
-
-wr(REG_CAL,4096);
-
-wr(REG_CFG,0x399F);
+    if (p_id > 0x07)
+    {
+        p_id = 0x01;
+    }
 
 
-k_msleep(15);
-
-
-init=true;
-
+    return p_id;
 }
 
 
-
-
-rd(REG_SHUNT,&raw);
-
-
-float shunt=raw*0.01f;
-
-
-
-rd(REG_BUS,&raw);
-
-
-float bus=((uint16_t)raw>>3)*0.004f;
-
-
-
-return bus+(shunt/1000.0f);
-
-
-}
-
-
-
-
-
-
-
-/* ================= HEADER BUILDER ================= */
-
-
+/* =========================================================
+ * HEADER BUILDER
+ *
+ * Byte 0 = Command + Payload ID
+ * Byte 1 = Device ID
+ * Byte 2 = QoS/Hop/Flags
+ * ========================================================= */
 
 void header_builder(uint8_t cmd)
 {
+    uint8_t pld;
 
 
-/*
-
-Byte0 = Command
-
-Byte1 = Device ID + Tunnel ID
-
-Byte2 = QoS/Hop/Flags
-
-*/
+    pld = pld_cnt();
 
 
+    /* Byte 0 */
 
-p_hdr[0]=cmd;
-
-
-
-p_hdr[1]=DEV_ID;
+    p_hdr[0] =
+        cmd + pld;
 
 
+    /* Byte 1 */
 
-p_hdr[2]=
-((DEFAULT_QOS & 0x03)<<6) |
-((DEFAULT_HOP & 0x07)<<3) |
-(DEFAULT_FLAGS & 0x07);
-
+    p_hdr[1] =
+        DEV_ID;
 
 
+    /* Byte 2 */
+
+    p_hdr[2] =
+        ((DEFAULT_QOS & 0x03) << 6) |
+        ((DEFAULT_HOP & 0x07) << 3) |
+        (DEFAULT_FLAGS & 0x07);
 
 
-LOG_INF("Header Built");
+    LOG_INF("========== HEADER BUILT ==========");
 
-LOG_INF("Command : 0x%02X",
-        p_hdr[0]);
+    LOG_INF("Command  : 0x%02X",
+            p_hdr[0]);
 
-
-LOG_INF("Dev ID  : 0x%02X",
-        p_hdr[1]);
-
-
-LOG_INF("QHF     : 0x%02X",
-        p_hdr[2]);
-
-
+    LOG_INF("Device ID : 0x%02X",
+            p_hdr[1]);
+    LOG_INF("QHF Byte  : 0x%02X",
+            p_hdr[2]);
 }
-/* ================= RETRANSMISSION ================= */
 
 
-void retx()
+/* =========================================================
+ * RETRANSMISSION
+ * ========================================================= */
+
+void retx(void)
 {
+    /*
+     * Duplicate packet check
+     *
+     * Compare:
+     * Byte 0 = Command
+     * Byte 1 = Device ID
+     */
 
-/*
-Duplicate check
+    if ((data[0] == us[0]) &&
+        (data[1] == us[1]))
+    {
+        LOG_INF("Duplicate data received, skipping transmission");
 
-Byte0 = Command
-Byte1 = Device ID/Tunnel
-Byte2 = QoS/Hop/Flags
-
-*/
+        return;
+    }
 
 
-if((data[0] == us[0]) &&
-   (data[1] == us[1]) &&
-   (data[2] == us[2]))
-{
+    /*
+     * Save received packet
+     */
 
-LOG_INF("Duplicate data received, skipping transmission");
+    memcpy(us, data, 256);
 
-return;
 
+    LOG_INF("New valid data received, transmitting...");
+
+
+    gpio_pin_set(gpio0,
+                 LED_PIN,
+                 1);
+
+
+    sendData(data);
+    k_msleep(100);
+
+    gpio_pin_set(gpio0,
+                 LED_PIN,
+                 0);
+
+
+    LOG_INF("Data transmitted");
 }
 
 
-memcpy(us,data,256);
-
-
-
-LOG_INF("New data received, transmitting...");
-
-
-
-gpio_pin_set(gpio0,
-             LED_PIN,
-             1);
-
-
-
-sendData(data);
-
-
-
-gpio_pin_set(gpio0,
-             LED_PIN,
-             0);
-
-
-
-LOG_INF("Data transmitted: %s",
-        data);
-
-
-}
-
-
-
-
-
-
-
-/* ================= DEVICE HEALTH ================= */
-
-
+/* =========================================================
+ * DEVICE HEALTH
+ * ========================================================= */
 
 void dev_hlth(void)
 {
+    char dev_rpt[128];
 
+    char battery[5];
 
-char dev_rpt[128];
 
-char battery[5];
+    /* Read battery */
 
+    bat_v =
+        battery_voltage();
 
 
-bat_v=battery_voltage();
+    LOG_INF("Preparing device health report...");
 
 
+    /*
+     * Build header
+     *
+     * Base command = 0x20
+     */
 
-LOG_INF("Preparing device health report...");
+    header_builder(0x20);
 
 
+    /*
+     * Battery status
+     */
 
-/*
- Build Header
+    snprintf(battery,
+             sizeof(battery),
+             "%s",
+             bat_v < 4.00f ? "BL" : "OK");
 
-Command = 0x20
-*/
 
-header_builder(0x20);
+    /*
+     * Copy 4-byte header
+     */
 
+    memcpy(dev_rpt,
+           p_hdr,
+           sizeof(p_hdr));
 
 
+    /*
+     * Copy battery payload
+     *
+     * Payload starts from Byte 4
+     */
 
-snprintf(battery,
-         sizeof(battery),
-         "%s",
-         bat_v < 4.00f ? "BL":"OK");
+    memcpy(dev_rpt + sizeof(p_hdr),
+           battery,
+           strlen(battery) + 1);
 
 
+    LOG_INF("========== DEVICE HEALTH REPORT ==========");
 
 
+    LOG_INF("Command  : 0x%02X",
+            (uint8_t)dev_rpt[0]);
 
-/*
- Copy Header
 
-Byte0 Command
-Byte1 Device ID
-Byte2 QoS/Hop/Flags
+    LOG_INF("Device ID : 0x%02X",
+            (uint8_t)dev_rpt[1]);
 
-*/
+    /*
+     * Decode QHF
+     */
 
+    uint8_t qos;
 
-memcpy(dev_rpt,
-       p_hdr,
-       sizeof(p_hdr));
+    uint8_t hop;
 
+    uint8_t flags;
 
 
+    qos =
+        ((uint8_t)dev_rpt[2] >> 6) & 0x03;
 
-/*
- Payload after header
 
-Byte3 onwards
+    hop =
+        ((uint8_t)dev_rpt[2] >> 3) & 0x07;
 
-*/
 
+    flags =
+        (uint8_t)dev_rpt[2] & 0x07;
 
-memcpy(dev_rpt + sizeof(p_hdr),
-       battery,
-       strlen(battery)+1);
 
+    LOG_INF("QHF Byte : 0x%02X",
+            (uint8_t)dev_rpt[2]);
 
 
+    LOG_INF("QoS      : %d",
+            qos);
 
 
+    LOG_INF("Hop Count: %d",
+            hop);
 
-LOG_INF("========== DEVICE HEALTH REPORT ==========");
 
+    LOG_INF("Flags    : %d",
+            flags);
 
 
-LOG_INF("Command : 0x%02X",
-        (uint8_t)dev_rpt[0]);
+    LOG_INF("Battery  : %s",
+            &dev_rpt[4]);
 
 
+    /*
+     * Send health report
+     */
 
-LOG_INF("Dev ID  : 0x%02X",
-        (uint8_t)dev_rpt[1]);
+    gpio_pin_set(gpio0,
+                 LED_PIN,
+                 1);
 
 
+    sendData(dev_rpt);
+    k_msleep(100);
 
-LOG_INF("Tunnel ID : 0b%02x",
-        dev_rpt[1] & TUNNEL_MASK);
 
-
-
-
-
-uint8_t qos;
-
-uint8_t hop;
-
-uint8_t flags;
-
-
-
-qos =
-(dev_rpt[2] >> 6) & 0x03;
-
-
-hop =
-(dev_rpt[2] >> 3) & 0x07;
-
-
-flags =
-dev_rpt[2] & 0x07;
-
-
-
-
-
-LOG_INF("QHF Byte : 0x%02X",
-        (uint8_t)dev_rpt[2]);
-
-
-
-LOG_INF("QoS       : %d",
-        qos);
-
-
-
-LOG_INF("Hop Count : %d",
-        hop);
-
-
-
-LOG_INF("Flags     : %d",
-        flags);
-
-
-
-LOG_INF("Battery   : %s",
-        &dev_rpt[3]);
-
-
-
-
-
-gpio_pin_set(gpio0,
-             LED_PIN,
-             1);
-
-
-
-sendData(dev_rpt);
-
-
-
-gpio_pin_set(gpio0,
-             LED_PIN,
-             0);
-
-
-
+    gpio_pin_set(gpio0,
+                 LED_PIN,
+                 0);
 }
-//id="main_part"
+
+
+/* =========================================================
+ * MAIN
+ * ========================================================= */
+
 int main(void)
 {
+    const struct device *dev;
 
-const struct device *dev;
 
+    /* =====================================================
+     * USB
+     * ===================================================== */
 
+    usb_enable(NULL);
 
-usb_enable(NULL);
 
+    /* =====================================================
+     * GPIO
+     * ===================================================== */
 
+    gpio0 =
+        DEVICE_DT_GET(DT_NODELABEL(gpio0));
 
-/* ================= GPIO ================= */
 
+    if (!device_is_ready(gpio0))
+    {
+        LOG_ERR("GPIO device not ready");
 
-gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+        return 0;
+    }
 
 
-if(!device_is_ready(gpio0))
-{
+    gpio_pin_configure(gpio0,
+                       LED_PIN,
+                       GPIO_OUTPUT);
 
-LOG_ERR("GPIO device not ready");
 
-return 0;
+    /* =====================================================
+     * CONSOLE
+     * ===================================================== */
 
-}
+    dev =
+        DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
 
+    if (!device_is_ready(dev))
+    {
+        return 0;
+    }
 
-gpio_pin_configure(gpio0,
-                   LED_PIN,
-                   GPIO_OUTPUT);
 
+    k_sleep(K_SECONDS(2));
 
 
+    /* =====================================================
+     * PRINT DEVICE INFORMATION
+     * ===================================================== */
 
+    print_device_id();
 
-/* ================= Console ================= */
 
+    /* =====================================================
+     * LORA INITIALIZATION
+     * ===================================================== */
 
-dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    ConfigureLora();
 
 
+    llcc68_request(LLCC68_RX_CONTINUOUS);
 
-if(!device_is_ready(dev))
-{
 
-return 0;
+    LOG_INF("Continuous RX started");
 
-}
 
+    /* =====================================================
+     * DEVICE HEALTH TIMER
+     *
+     * First execution = 5 minutes
+     * Repeat          = every 5 minutes
+     * ===================================================== */
 
+    k_timer_start(&timeout_timer,
+                  K_MINUTES(5),
+                  K_MINUTES(5));
 
-k_sleep(K_SECONDS(2));
 
+    /* =====================================================
+     * MAIN LOOP
+     * ===================================================== */
 
+    while (true)
+    {
+        data =
+            receiveDataContinuous();
 
-print_device_id();
 
+        /* =================================================
+         * NO PACKET RECEIVED
+         * ================================================= */
 
+        if (data == NULL)
+        {
+            if (timeout)
+            {
+                timeout = false;
 
+                dev_hlth();
+            }
 
 
-/* ================= LORA ================= */
+            k_msleep(1000);
 
+            continue;
+        }
 
-ConfigureLora();
 
+        /* =================================================
+         * PACKET RECEIVED
+         * ================================================= */
 
+        gpio_pin_toggle(gpio0,
+                        LED_PIN);
 
-llcc68_request(LLCC68_RX_CONTINUOUS);
 
+        LOG_INF("=========== RELAY RECEIVED ===========");
 
 
-LOG_INF("Continuous RX started");
+        /*
+         * Byte 0
+         *
+         * Command
+         */
 
+        LOG_INF("Command received : 0x%02X",
+                (uint8_t)data[0]& 0xF8);
 
 
+        /*
+         * Byte 1
+         *
+         * Device ID
+         */
 
-/* Timer 5 minutes */
+        LOG_INF("Device ID received: 0x%02X",
+                (uint8_t)data[1]);
 
 
-k_timer_start(&timeout_timer,
-              K_MINUTES(5),
-              K_MINUTES(5));
+       
 
+        /* =================================================
+         * BYTE 3 = QoS / Hop / Flags
+         * ================================================= */
 
+        uint8_t qos;
 
+        uint8_t hop;
 
+        uint8_t flags;
 
-while(true)
-{
 
+        qos =
+            ((uint8_t)data[2] >> 6) & 0x03;
 
-data = receiveDataContinuous();
 
+        hop =
+            ((uint8_t)data[2] >> 3) & 0x07;
 
 
+        flags =
+            (uint8_t)data[2] & 0x07;
 
-if(data == NULL)
-{
 
+        LOG_INF("QHF Byte          : 0x%02X",
+                (uint8_t)data[2]);
 
-if(timeout)
-{
 
-timeout=false;
+        LOG_INF("QoS               : %d",
+                qos);
 
-dev_hlth();
 
-}
+        LOG_INF("Hop Count         : %d",
+                hop);
 
 
+        LOG_INF("Flags             : %d",
+                flags);
 
-k_msleep(50);
 
-continue;
+        /* =================================================
+         * DEVICE ID VALIDATION
+         * ================================================= */
 
+        /*if ((uint8_t)data[1] != DEV_ID)
+        {
+            LOG_INF("Invalid Device ID");
 
-}
 
+            LOG_INF("Expected Device ID: 0x%02X",
+                    DEV_ID);
 
 
+            LOG_INF("Received Device ID: 0x%02X",
+                    (uint8_t)data[1]);
 
 
+            k_msleep(50);
 
-gpio_pin_toggle(gpio0,
-                LED_PIN);
+            continue;
+        }*/
 
 
+        /* =================================================
+         * TUNNEL ID VALIDATION
+         * ================================================= */
 
+        if ((data[1] & 0xc0) != (DEV_ID & 0xc0)) {
+             LOG_INF("Invalid Tunnel ID received, skipping transmission");
 
-LOG_INF("===========RELAY RECEIVED===========");
+            k_msleep(50);
 
+            continue;
+        }
 
 
+        /* =================================================
+         * BOTH VALID
+         * ================================================= */
 
+        
 
-/* Existing command */
 
+        /* =================================================
+         * COMMAND HANDLING
+         * ================================================= */
 
-LOG_INF("command received: 0x%02X",
-        data[0]);
+        switch ((uint8_t)data[0] & 0xF8)
+        {
 
+            /* ---------------------------------------------
+             * Normal data packet
+             * --------------------------------------------- */
 
+            case 0x00:
 
+                LOG_INF("Normal data packet");
 
+                retx();
 
-/* Existing device ID */
+                break;
 
 
-LOG_INF("dev_id: 0x%02X",
-        data[1]);
+            /* ---------------------------------------------
+             * Health request
+             * --------------------------------------------- */
 
+            case 0x18:
 
+                LOG_INF("Health request received");
 
+                dev_hlth();
 
+                break;
 
-/* Existing tunnel ID */
 
+            /* ---------------------------------------------
+             * Health report
+             * --------------------------------------------- */
 
-LOG_INF("tunnel_id: 0b%02x",
-        data[1] & TUNNEL_MASK);
+            case 0x20:
 
+                LOG_INF("Device health report received");
 
+                retx();
 
+                break;
 
 
+            /* ---------------------------------------------
+             * Relay data packet
+             * --------------------------------------------- */
 
+            case 0x50:
 
+                LOG_INF("Relay data packet 0x50 received");
 
-/* ================= NEW QOS ================= */
+                retx();
 
+                break;
 
-uint8_t qos;
 
-uint8_t hop;
+            /* ---------------------------------------------
+             * Unknown command
+             * --------------------------------------------- */
 
-uint8_t flags;
+            default:
 
+                LOG_INF("Unknown command received: 0x%02X",
+                        (uint8_t)data[0]);
 
+                break;
+        }
 
-qos =
-(data[2] >> 6) & 0x03;
 
+        k_msleep(50);
 
 
-hop =
-(data[2] >> 3) & 0x07;
+        gpio_pin_toggle(gpio0,
+                        LED_PIN);
+    }
 
 
-
-flags =
-data[2] & 0x07;
-
-
-
-
-LOG_INF("QHF byte : 0x%02X",
-        data[2]);
-
-
-
-LOG_INF("QoS       : %d",
-        qos);
-
-
-
-LOG_INF("Hop Count : %d",
-        hop);
-
-
-
-LOG_INF("Flags     : %d",
-        flags);
-
-
-
-
-
-
-/* Tunnel validation */
-
-
-if((data[1] & TUNNEL_MASK) !=
-   (DEV_ID & TUNNEL_MASK))
-{
-
-LOG_INF("Invalid Tunnel ID received");
-
-k_msleep(50);
-
-continue;
-
-}
-
-
-
-
-
-
-
-/* Device validation */
-
-
-if(data[1] != DEV_ID)
-{
-
-LOG_INF("Invalid Device ID received");
-
-k_msleep(50);
-
-continue;
-
-}
-
-
-
-
-
-
-
-/* Command Handling */
-
-
-switch(data[0] & 0xF8)
-{
-
-
-case 0x00:
-
-
-retx();
-
-
-break;
-
-
-
-
-
-case 0x18:
-
-
-dev_hlth();
-
-
-break;
-
-
-
-
-
-case 0x20:
-
-
-LOG_INF("Device health report received, retx");
-
-
-retx();
-
-
-break;
-
-
-
-
-
-default:
-
-
-LOG_INF("Unknown command received: 0x%02X",
-        data[0]);
-
-
-break;
-
-
-
-}
-
-
-
-
-k_msleep(50);
-
-
-
-gpio_pin_toggle(gpio0,
-                LED_PIN);
-
-
-
-}
-
-
-
-return 0;
-
+    return 0;
 }
