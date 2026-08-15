@@ -1,416 +1,211 @@
-#include <zephyr/device.h>
-#include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/usb/usb_device.h>
-#include <string.h>
+#include <SPI.h>
+#include <LoRa.h>
 
-#include "llcc68_driver.h"
-#include "radio_driver.h"
+#define LORA_FREQUENCY 865E6
 
-LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
+// Command Ring (00-07)
+uint8_t commandID = 0x00;
 
+// Device ID Toggle
+bool devToggle = false;
 
-
-#define LED_PIN 17
-
-#define DEV_ID 0x81
+unsigned long lastSendTime = 0;
 
 #define SEND_INTERVAL 5000
 
+/*================ QoS / Hop / Flags ================*/
 
+#define DEFAULT_QOS    1     // 2 bits
+#define DEFAULT_HOP    0     // 3 bits
+#define DEFAULT_FLAGS  0     // 3 bits
 
-/*
- Header1 Bit Allocation
-
- Bit 7-6 : QoS       (2 bits)
- Bit 5-3 : Hop Count (3 bits)
- Bit 2-0 : Flags     (3 bits)
-
-*/
-
-
-#define QOS_VALUE       0x01     // 0-3
-#define HOP_COUNT_VALUE 0x02     // 0-7
-#define FLAGS_VALUE     0x00     // 0-7
-
-
-
-uint8_t commandID = 0x00;
-
-uint8_t rx_last[64];
-
-
-
-const struct device *gpio0;
-
-
-
-/*
- Pack QoS + Hop Count + Flags
-*/
-
-uint8_t create_header1(void)
+void setup()
 {
+    Serial.begin(115200);
 
-    uint8_t header1;
+    while (!Serial);
 
+    Serial.println("Starting LoRa...");
 
-    header1 =  ((QOS_VALUE & 0x03) << 6) |
-               ((HOP_COUNT_VALUE & 0x07) << 3) |
-               (FLAGS_VALUE & 0x07);
+    if (!LoRa.begin(LORA_FREQUENCY))
+    {
+        Serial.println("LoRa init failed!");
+        while (1);
+    }
 
+    LoRa.setTxPower(22, PA_OUTPUT_PA_BOOST_PIN);
+    LoRa.setSpreadingFactor(10);
+    LoRa.setSignalBandwidth(125E3);
+    LoRa.setCodingRate4(7);
+    LoRa.setPreambleLength(16);
+    LoRa.setSyncWord(0x34);
+    LoRa.enableCrc();
 
+    Serial.println("LoRa Ready");
+    Serial.println("Automatic Ring Test Started");
 
-    return header1;
-
+    LoRa.receive();
 }
 
-
-
-
-/*
- Arduino sendAutoPacket()
- Equivalent Zephyr function
-*/
-
-void send_auto_packet(void)
+void loop()
 {
+    /* Automatic Transmit */
 
-    uint8_t packet[64];
+    if (millis() - lastSendTime >= SEND_INTERVAL)
+    {
+        lastSendTime = millis();
 
+        sendAutoPacket();
+    }
+}
 
-    uint8_t header1;
+    /* Receive 
 
-    uint8_t header2 = DEV_ID;
+    int packetSize = LoRa.parsePacket();
 
+    if (packetSize)
+    {
+        uint8_t header1 = 0x01;
+        uint8_t header2 = 0;
+        uint8_t header3 = 0;
 
+        if (LoRa.available())
+            header1 = LoRa.read();
 
-    memset(packet,0,sizeof(packet));
+        if (LoRa.available())
+            header2 = LoRa.read();
 
+        if (LoRa.available())
+            header3 = LoRa.read();
 
+        uint8_t qos   = (header3 >> 6) & 0x03;
+        uint8_t hop   = (header3 >> 3) & 0x07;
+        uint8_t flags = header3 & 0x07;
 
-    /*
-       Header1
-       QoS + Hop + Flags
-    */
+        String payload = "";
 
-    header1 = create_header1();
+        while (LoRa.available())
+        {
+            payload += (char)LoRa.read();
+        }
 
+        Serial.println();
+        Serial.println("========== RX PACKET ==========");
 
+        Serial.print("Command : 0x");
+        if (header1 < 0x10)
+            Serial.print("0");
+        Serial.println(header1, HEX);
 
-    packet[0] = header1;
+        Serial.print("DEV_ID  : 0x");
+        if (header2 < 0x10)
+            Serial.print("0");
+        Serial.println(header2, HEX);
 
+        Serial.print("QHF     : 0x");
+        if (header3 < 0x10)
+            Serial.print("0");
+        Serial.println(header3, HEX);
 
+        Serial.print("QoS     : ");
+        Serial.println(qos);
 
-    /*
-       Header2
-    */
+        Serial.print("Hop     : ");
+        Serial.println(hop);
 
-    packet[1] = header2;
+        Serial.print("Flags   : ");
+        Serial.println(flags);
 
+        Serial.print("DATA    : ");
+        Serial.println(payload);
 
+        Serial.print("RSSI    : ");
+        Serial.println(LoRa.packetRssi());
 
-    /*
-       Payload
-    */
+        Serial.print("SNR     : ");
+        Serial.println(LoRa.packetSnr());
 
-    strcpy((char *)&packet[2],"Hello");
+        Serial.println("===============================");
 
+        LoRa.receive();
+    }*/
 
+void sendAutoPacket()
+{
+    uint8_t header1 = commandID;
 
-    LOG_INF("========== TX PACKET ==========");
+    // Fixed Device ID
+    uint8_t header2 = 0x7F;
 
+    // QoS / Hop / Flags
+    uint8_t header3 =
+        ((DEFAULT_QOS & 0x03) << 6) |
+        ((DEFAULT_HOP & 0x07) << 3) |
+        (DEFAULT_FLAGS & 0x07);
 
-    LOG_INF("Header1 : 0x%02X",header1);
+    String payload = "Hello";
 
+    Serial.println();
+    Serial.println("========== TX PACKET ==========");
 
-    LOG_INF("QoS     : %d",QOS_VALUE);
+    Serial.print("Command : 0x");
+    if (header1 < 0x10)
+        Serial.print("0");
+    Serial.println(header1, HEX);
 
+    Serial.print("DEV_ID  : 0x");
+    if (header2 < 0x10)
+        Serial.print("0");
+    Serial.println(header2, HEX);
 
-    LOG_INF("Hop     : %d",HOP_COUNT_VALUE);
+    Serial.print("QHF     : 0x");
+    if (header3 < 0x10)
+        Serial.print("0");
+    Serial.println(header3, HEX);
 
+    Serial.print("QoS     : ");
+    Serial.println((header3 >> 6) & 0x03);
 
-    LOG_INF("Flags   : %d",FLAGS_VALUE);
+    Serial.print("Hop     : ");
+    Serial.println((header3 >> 3) & 0x07);
 
+    Serial.print("Flags   : ");
+    Serial.println(header3 & 0x07);
 
-    LOG_INF("DEV_ID  : 0x%02X",header2);
+    Serial.print("DATA    : ");
+    Serial.println(payload);
 
+    LoRa.idle();
 
-    LOG_INF("DATA    : Hello");
+    LoRa.beginPacket();
 
+    // Byte0 : Command
+    LoRa.write(header1);
 
+    // Byte1 : Device ID
+    LoRa.write(header2);
 
-    gpio_pin_set(gpio0,LED_PIN,1);
+    // Byte2 : QoS / Hop / Flags
+    LoRa.write(header3);
 
+    // Payload
+    for (int i = 0; i < payload.length(); i++)
+    {
+        LoRa.write((uint8_t)payload[i]);
+    }
 
+    LoRa.endPacket();
 
-    sendData(packet);
+    Serial.println("Packet Sent");
+    Serial.println("===============================");
 
-
-
-    gpio_pin_set(gpio0,LED_PIN,0);
-
-
-
-    LOG_INF("Packet Sent");
-
-
-    LOG_INF("===============================");
-
-
-
-    /*
-       Command ring
-       00-07
-    */
-
-
+    // Command Ring (00-07)
     commandID++;
 
-
-    if(commandID > 0x07)
+    if (commandID > 0x07)
     {
-        commandID = 0x00;
+        commandID = 0x01;
     }
 
-}
-
-
-
-
-void process_received(uint8_t *data)
-{
-
-    uint8_t header1;
-
-    uint8_t header2;
-
-
-
-    header1 = data[0];
-
-    header2 = data[1];
-
-
-
-    /*
-       Extract Header1 fields
-    */
-
-
-    uint8_t qos;
-
-    uint8_t hop;
-
-    uint8_t flags;
-
-
-
-    qos   = (header1 >> 6) & 0x03;
-
-    hop   = (header1 >> 3) & 0x07;
-
-    flags = header1 & 0x07;
-
-
-
-
-    LOG_INF("========== RX PACKET ==========");
-
-
-
-    LOG_INF("Header1 : 0x%02X",header1);
-
-
-    LOG_INF("QoS     : %d",qos);
-
-
-    LOG_INF("Hop     : %d",hop);
-
-
-    LOG_INF("Flags   : %d",flags);
-
-
-
-    LOG_INF("DEV_ID  : 0x%02X",header2);
-
-
-
-    LOG_INF("DATA    : %s",&data[2]);
-
-
-
-    LOG_INF("===============================");
-
-
-
-
-
-    /*
-       Check Device ID
-    */
-
-
-    if(header2 != DEV_ID)
-    {
-
-        LOG_INF("Invalid Device ID");
-
-        return;
-
-    }
-
-
-
-
-
-    /*
-       Retransmit if required
-    */
-
-
-    if((flags & 0x01)==0x00)
-    {
-
-
-        LOG_INF("Data packet received");
-
-
-        sendData(data);
-
-
-    }
-
-
-}
-
-
-
-
-
-int main(void)
-{
-
-
-    usb_enable(NULL);
-
-
-
-    gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-
-
-
-    if(!device_is_ready(gpio0))
-    {
-
-        LOG_ERR("GPIO not ready");
-
-        return 0;
-
-    }
-
-
-
-
-
-    gpio_pin_configure(
-        gpio0,
-        LED_PIN,
-        GPIO_OUTPUT
-    );
-
-
-
-
-
-    ConfigureLora();
-
-
-
-
-
-    llcc68_request(LLCC68_RX_CONTINUOUS);
-
-
-
-
-
-    LOG_INF("LoRa RX Started");
-
-
-
-
-
-    uint32_t last_send = 0;
-
-
-
-
-
-    while(1)
-    {
-
-
-        /*
-          Auto TX every 5 seconds
-        */
-
-
-        if((k_uptime_get_32()-last_send) >= SEND_INTERVAL)
-        {
-
-
-            last_send = k_uptime_get_32();
-
-
-            send_auto_packet();
-
-
-        }
-
-
-
-
-
-
-
-        /*
-          Continuous RX
-        */
-
-
-        uint8_t *data;
-
-
-
-        data = receiveDataContinuous();
-
-
-
-
-
-        if(data != NULL)
-        {
-
-
-            process_received(data);
-
-
-        }
-
-
-
-
-
-        k_msleep(50);
-
-
-
-    }
-
-
-
-    return 0;
-
+   // LoRa.receive();
 }
