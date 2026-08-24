@@ -23,7 +23,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
  * ========================================================= */
 
 #define LED_PIN     17
-#define DEV_ID      0x41
+#define DEV_ID      0x81
 
 
 /* =========================================================
@@ -33,12 +33,14 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 #define CMD_NORMAL_DATA       0x00
 #define CMD_HEALTH_REQUEST    0x18
 #define CMD_HEALTH_DATA       0x20
+#define CMD_RELAY_DATA        0x50
 
 
 /* =========================================================
  * QoS / Hop / Flags
  *
- * Byte2:
+ * Byte 2:
+ *
  * Bit 7-6 = QoS
  * Bit 5-3 = Hop Count
  * Bit 2-0 = Flags
@@ -72,7 +74,7 @@ static const struct device *gpio0;
 /*
  * Packet format:
  *
- * Byte 0 : Command
+ * Byte 0 : Command + Payload ID
  * Byte 1 : Device ID
  * Byte 2 : QoS + Hop Count + Flags
  * Byte 3 : Payload
@@ -94,18 +96,21 @@ float bat_v = 0.0f;
 /*
  * Received packet
  */
+
 char *data;
 
 
 /*
  * Previous packet used for duplicate checking
  */
+
 char us[256] = {0};
 
 
 /*
  * Health timer flag
  */
+
 volatile bool timeout = false;
 
 
@@ -121,6 +126,9 @@ void print_device_id(void)
     printf("Device ID: %08X%08X\n",
            id1,
            id0);
+
+    LOG_INF("Application Device ID : 0x%02X",
+            DEV_ID);
 }
 
 
@@ -169,12 +177,13 @@ static int rd(uint8_t reg, int16_t *val)
 {
     uint8_t b[2];
 
-    int ret = i2c_write_read(i2c,
-                             INA219_ADDR,
-                             &reg,
-                             1,
-                             b,
-                             2);
+    int ret =
+        i2c_write_read(i2c,
+                       INA219_ADDR,
+                       &reg,
+                       1,
+                       b,
+                       2);
 
     *val = (b[0] << 8) | b[1];
 
@@ -194,11 +203,13 @@ float battery_voltage(void)
 
     if (!init)
     {
-        i2c = DEVICE_DT_GET(DT_NODELABEL(i2c0));
+        i2c =
+            DEVICE_DT_GET(DT_NODELABEL(i2c0));
 
         if (!device_is_ready(i2c))
         {
             LOG_ERR("INA219 I2C not ready");
+
             return -1.0f;
         }
 
@@ -214,7 +225,8 @@ float battery_voltage(void)
 
     rd(REG_SHUNT, &raw);
 
-    float shunt = raw * 0.01f;
+    float shunt =
+        raw * 0.01f;
 
 
     rd(REG_BUS, &raw);
@@ -231,7 +243,7 @@ float battery_voltage(void)
  * PAYLOAD COUNTER
  * ========================================================= */
 
-uint8_t pld_cnt()
+uint8_t pld_cnt(void)
 {
     p_id = p_id + 0x01;
 
@@ -250,18 +262,23 @@ uint8_t pld_cnt()
 
 void header_builder(uint8_t cmd_t)
 {
-    uint8_t pld = pld_cnt();
+    uint8_t pld =
+        pld_cnt();
 
 
     /*
-     * Byte0 = Command + Payload ID
-     * Byte1 = Device ID
-     * Byte2 = QoS/Hop/Flags
+     * Byte 0 = Command + Payload ID
+     * Byte 1 = Device ID
+     * Byte 2 = QoS / Hop / Flags
      */
 
-    p_hdr[0] = cmd_t + pld;
+    p_hdr[0] =
+        cmd_t + pld;
 
-    p_hdr[1] = DEV_ID;
+
+    p_hdr[1] =
+        DEV_ID;
+
 
     p_hdr[2] =
         ((DEFAULT_QOS & 0x03) << 6) |
@@ -269,7 +286,7 @@ void header_builder(uint8_t cmd_t)
         (DEFAULT_FLAGS & 0x07);
 
 
-    LOG_INF("Header Built");
+    LOG_INF("========== HEADER BUILT ==========");
 
     LOG_INF("Command : 0x%02X",
             p_hdr[0]);
@@ -283,34 +300,49 @@ void header_builder(uint8_t cmd_t)
 
 
 /* =========================================================
- * RETRANSMISSION
+ * RETRANSMISSION / JUNCTION FORWARD
  *
- * Receive:
+ * Flow:
+ *
+ * Sender  -> Hop 0
+ * Relay   -> Hop 1
+ * Junction -> Hop 2
+ * Edge    -> receives Hop 2
+ *
+ *
+ * Example:
+ *
+ * Relay sends:
  *
  * 50 81 48 Hello
  *
- * QoS  = 1
- * Hop  = 1
- * Flag = 0
+ * QOS   = 1
+ * Hop   = 1
+ * Flags = 0
  *
  *
  * Junction changes:
  *
  * 50 81 50 Hello
  *
- * QoS  = 1
- * Hop  = 2
- * Flag = 0
+ * QOS   = 1
+ * Hop   = 2
+ * Flags = 0
  * ========================================================= */
 
-void retx()
+void retx(void)
 {
-    /*
-     * Duplicate packet check
-     */
+    uint8_t qos;
+    uint8_t hop;
+    uint8_t flags;
+
+
+    /* =====================================================
+     * DUPLICATE PACKET CHECK
+     * ===================================================== */
 
     if ((data[0] == us[0]) &&
-        (data[1] == us[1]) )
+        (data[1] == us[1]))
     {
         LOG_INF("Duplicate data received, skipping transmission");
 
@@ -318,45 +350,65 @@ void retx()
     }
 
 
-    /*
-     * Save current packet
-     */
+    /* =====================================================
+     * SAVE CURRENT PACKET
+     * ===================================================== */
 
-    memcpy(us, data, 256);
+    memcpy(us,
+           data,
+           256);
 
 
-    LOG_INF("New data received");
+    /* =====================================================
+     * READ QoS
+     * ===================================================== */
 
-
-    /*
-     * Read current QoS / Hop / Flags
-     */
-
-    uint8_t qos =
+    qos =
         ((uint8_t)data[2] >> 6) & 0x03;
 
-    uint8_t hop =
+
+    /* =====================================================
+     * READ HOP COUNT
+     * ===================================================== */
+
+    hop =
         ((uint8_t)data[2] >> 3) & 0x07;
 
-    uint8_t flags =
+
+    /* =====================================================
+     * READ FLAGS
+     * ===================================================== */
+
+    flags =
         (uint8_t)data[2] & 0x07;
 
 
-    LOG_INF("Before retransmission");
+    LOG_INF("========== JUNCTION FORWARD ==========");
 
-    LOG_INF("QoS      : %d",
+    LOG_INF("Received QHF : 0x%02X",
+            (uint8_t)data[2]);
+
+    LOG_INF("Received QoS : %d",
             qos);
 
-    LOG_INF("Hop Count: %d",
+    LOG_INF("Received Hop : %d",
             hop);
 
-    LOG_INF("Flags    : %d",
+    LOG_INF("Received Flags : %d",
             flags);
 
 
-    /*
-     * Increase Hop Count
-     */
+    /* =====================================================
+     * INCREMENT HOP COUNT
+     *
+     * Relay already changed:
+     *
+     * Hop 0 -> Hop 1
+     *
+     * Now Junction changes:
+     *
+     * Hop 1 -> Hop 2
+     * ===================================================== */
 
     if (hop < 7)
     {
@@ -364,15 +416,23 @@ void retx()
     }
     else
     {
-        LOG_INF("Maximum hop count reached");
+        LOG_INF("Maximum Hop Count reached");
 
         return;
     }
 
 
-    /*
-     * Build new QHF byte
-     */
+    LOG_INF("Junction incremented Hop to : %d",
+            hop);
+
+
+    /* =====================================================
+     * REBUILD BYTE 2
+     *
+     * QoS  = unchanged
+     * Hop  = incremented
+     * Flags = unchanged
+     * ===================================================== */
 
     data[2] =
         ((qos & 0x03) << 6) |
@@ -380,48 +440,35 @@ void retx()
         (flags & 0x07);
 
 
-    LOG_INF("After retransmission");
-
-    LOG_INF("New QHF Byte: 0x%02X",
+    LOG_INF("New QHF Byte : 0x%02X",
             (uint8_t)data[2]);
 
-    LOG_INF("QoS      : %d",
-            qos);
 
-    LOG_INF("Hop Count: %d",
-            hop);
-
-    LOG_INF("Flags    : %d",
-            flags);
-
-
-    /*
-     * LED ON
-     */
+    /* =====================================================
+     * FINAL FORWARD
+     * ===================================================== */
 
     gpio_pin_set(gpio0,
                  LED_PIN,
                  1);
 
 
-    /*
-     * Send packet to next receiver
-     */
-
     sendData(data);
+
     k_msleep(100);
 
-
-    /*
-     * LED OFF
-     */
 
     gpio_pin_set(gpio0,
                  LED_PIN,
                  0);
 
 
-    LOG_INF("Data retransmitted to receiver");
+    LOG_INF("Packet forwarded to Edge");
+
+    LOG_INF("Final Hop sent by Junction : %d",
+            hop);
+
+    LOG_INF("========================================");
 }
 
 
@@ -436,67 +483,81 @@ void dev_hlth(void)
     char battery[5];
 
 
-    bat_v = battery_voltage();
+    /* =====================================================
+     * READ BATTERY
+     * ===================================================== */
+
+    bat_v =
+        battery_voltage();
 
 
     LOG_INF("Preparing device health report...");
 
 
-    /*
-     * Command = 0x20
-     */
+    /* =====================================================
+     * BUILD HEALTH HEADER
+     * ===================================================== */
 
     header_builder(CMD_HEALTH_DATA);
 
 
+    /* =====================================================
+     * BATTERY STATUS
+     * ===================================================== */
+
     if (bat_v < 4.00f)
     {
-        strcpy(battery, "BL");
+        strcpy(battery,
+               "BL");
     }
     else
     {
-        strcpy(battery, "OK");
+        strcpy(battery,
+               "OK");
     }
 
 
-    /*
-     * Copy header
-     */
+    /* =====================================================
+     * COPY HEADER
+     * ===================================================== */
 
     memcpy(dev_rpt,
            p_hdr,
            sizeof(p_hdr));
 
 
-    /*
-     * Copy battery payload
-     */
+    /* =====================================================
+     * COPY BATTERY PAYLOAD
+     *
+     * Header = 3 bytes
+     * Payload starts at Byte 3
+     * ===================================================== */
 
     memcpy(dev_rpt + sizeof(p_hdr),
            battery,
            strlen(battery) + 1);
 
 
-    LOG_INF("========== DEVICE HEALTH REPORT ==========");
+    /* =====================================================
+     * LOG HEALTH REPORT
+     * ===================================================== */
 
+    LOG_INF("========== DEVICE HEALTH REPORT ==========");
 
     LOG_INF("Command : 0x%02X",
             (uint8_t)dev_rpt[0]);
-
 
     LOG_INF("Dev ID  : 0x%02X",
             (uint8_t)dev_rpt[1]);
 
 
-    /*
-     * Decode QHF
-     */
-
     uint8_t qos =
         ((uint8_t)dev_rpt[2] >> 6) & 0x03;
 
+
     uint8_t hop =
         ((uint8_t)dev_rpt[2] >> 3) & 0x07;
+
 
     uint8_t flags =
         (uint8_t)dev_rpt[2] & 0x07;
@@ -505,26 +566,22 @@ void dev_hlth(void)
     LOG_INF("QHF Byte : 0x%02X",
             (uint8_t)dev_rpt[2]);
 
-
     LOG_INF("QoS      : %d",
             qos);
-
 
     LOG_INF("Hop Count: %d",
             hop);
 
-
     LOG_INF("Flags    : %d",
             flags);
-
 
     LOG_INF("Battery  : %s",
             &dev_rpt[3]);
 
 
-    /*
-     * Send health report
-     */
+    /* =====================================================
+     * SEND HEALTH REPORT
+     * ===================================================== */
 
     gpio_pin_set(gpio0,
                  LED_PIN,
@@ -532,11 +589,16 @@ void dev_hlth(void)
 
 
     sendData(dev_rpt);
+
     k_msleep(100);
+
 
     gpio_pin_set(gpio0,
                  LED_PIN,
                  0);
+
+
+    LOG_INF("Health report sent");
 }
 
 
@@ -634,11 +696,12 @@ int main(void)
 
     while (true)
     {
-        /*
-         * Receive LoRa packet
-         */
+        /* =================================================
+         * RECEIVE PACKET
+         * ================================================= */
 
-        data = receiveDataContinuous();
+        data =
+            receiveDataContinuous();
 
 
         /* =================================================
@@ -647,10 +710,6 @@ int main(void)
 
         if (data == NULL)
         {
-            /*
-             * Check health timer
-             */
-
             if (timeout)
             {
                 timeout = false;
@@ -659,7 +718,7 @@ int main(void)
             }
 
 
-            k_msleep(5000);
+            k_msleep(1000);
 
             continue;
         }
@@ -673,19 +732,30 @@ int main(void)
                         LED_PIN);
 
 
-        LOG_INF("===========JUNCTION RECEIVED===========");
+        LOG_INF("=========== JUNCTION RECEIVED ===========");
 
+
+        /* =================================================
+         * BYTE 0
+         * COMMAND
+         * ================================================= */
 
         LOG_INF("Command received : 0x%02X",
                 (uint8_t)data[0]);
 
+
+        /* =================================================
+         * BYTE 1
+         * DEVICE ID
+         * ================================================= */
 
         LOG_INF("Dev ID           : 0x%02X",
                 (uint8_t)data[1]);
 
 
         /* =================================================
-         * QOS / HOP / FLAGS
+         * BYTE 2
+         * QoS / HOP / FLAGS
          * ================================================= */
 
         uint8_t qos =
@@ -716,6 +786,20 @@ int main(void)
                 flags);
 
 
+        /* =================================================
+         * TUNNEL ID INFORMATION
+         *
+         * Upper 2 bits of Byte 1
+         *
+         * 00 = Tunnel 0
+         * 01 = Tunnel 1
+         * 10 = Tunnel 2
+         * 11 = Tunnel 3
+         * ================================================= */
+
+        LOG_INF("Tunnel bits : 0x%02X",
+                (uint8_t)data[1] & 0xC0);
+
 
         /* =================================================
          * COMMAND HANDLING
@@ -723,28 +807,13 @@ int main(void)
 
         switch ((uint8_t)data[0] & 0xF8)
         {
-            /*
+            /* ---------------------------------------------
              * Normal data packet
              *
-             * 0x50
-             */
+             * Command = 0x00
+             * --------------------------------------------- */
 
             case CMD_NORMAL_DATA:
-
-                LOG_INF("Valid normal data packet received");
-
-                retx();
-
-                break;
-
-
-            /*
-             * Optional old normal command
-             *
-             * 0x00
-             */
-
-            case 0x50:
 
                 LOG_INF("Normal data packet received");
 
@@ -753,9 +822,24 @@ int main(void)
                 break;
 
 
-            /*
+            /* ---------------------------------------------
+             * Relay data packet
+             *
+             * Command = 0x50
+             * --------------------------------------------- */
+
+            case CMD_RELAY_DATA:
+
+                LOG_INF("Relay data packet received");
+
+                retx();
+
+                break;
+
+
+            /* ---------------------------------------------
              * Health request
-             */
+             * --------------------------------------------- */
 
             case CMD_HEALTH_REQUEST:
 
@@ -766,9 +850,9 @@ int main(void)
                 break;
 
 
-            /*
-             * Health packet
-             */
+            /* ---------------------------------------------
+             * Health data
+             * --------------------------------------------- */
 
             case CMD_HEALTH_DATA:
 
@@ -779,9 +863,9 @@ int main(void)
                 break;
 
 
-            /*
+            /* ---------------------------------------------
              * Unknown command
-             */
+             * --------------------------------------------- */
 
             default:
 
@@ -792,7 +876,7 @@ int main(void)
         }
 
 
-        k_msleep(5000);
+        k_msleep(100);
 
 
         gpio_pin_toggle(gpio0,
