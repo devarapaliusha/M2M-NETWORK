@@ -34,7 +34,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
  * Tunnel ID  = 0x81
  * ========================================================= */
 
-#define DEV_ID       0x88
+#define DEV_ID       0x87
 
 
 /* =========================================================
@@ -294,51 +294,57 @@ void header_builder(uint8_t cmd)
  * RETRANSMISSION
  * ========================================================= */
 
-void retx(void)
+void retx()
 {
-    /*
-     * Duplicate packet check
-     *
-     * Compare:
-     * Byte 0 = Command
-     * Byte 1 = Device ID
-     */
-
+    /* Duplicate packet check */
     if ((data[0] == us[0]) &&
         (data[1] == us[1]))
     {
-        LOG_INF("Duplicate data received, skipping transmission");
-
         return;
     }
 
-
-    /*
-     * Save received packet
-     */
-
+    /* Save packet */
     memcpy(us, data, 256);
 
+    /* Get Hop Count */
+    uint8_t hop =
+        ((uint8_t)data[2] >> 3) & 0x07;
 
-    LOG_INF("New valid data received, transmitting...");
+    /* Increment Hop */
+    if (hop < 7)
+    {
+        hop++;
+    }
+    else
+    {
+        return;
+    }
 
+    /* Keep QoS and Flags */
+    uint8_t qos =
+        ((uint8_t)data[2] >> 6) & 0x03;
 
-    gpio_pin_set(gpio0,
-                 LED_PIN,
-                 1);
+    uint8_t flags =
+        (uint8_t)data[2] & 0x07;
 
+    /* Update only Hop Count */
+    data[2] =
+        ((qos & 0x03) << 6) |
+        ((hop & 0x07) << 3) |
+        (flags & 0x07);
+
+    /* Send packet */
+    gpio_pin_set(gpio0, LED_PIN, 1);
 
     sendData(data);
+
     k_msleep(100);
 
-    gpio_pin_set(gpio0,
-                 LED_PIN,
-                 0);
+    gpio_pin_set(gpio0, LED_PIN, 0);
 
 
-    LOG_INF("Data transmitted");
+    LOG_INF("Data retransmitted to receiver");
 }
-
 
 /* =========================================================
  * DEVICE HEALTH
